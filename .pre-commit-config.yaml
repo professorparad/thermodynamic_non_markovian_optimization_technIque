@@ -1,0 +1,21 @@
+repos:
+  # Ruff — fast Python linter + formatter (replaces flake8, isort, black)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.4
+    hooks:
+      - id: ruff               # lint
+        args: [--fix]
+      - id: ruff-format        # format
+
+  # Standard hygiene hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: [--maxkb=500]    # block accidental large file commits (model weights etc.)
+      - id: check-merge-conflict
+      - id: debug-statements   # catch leftover breakpoint() / pdb calls

@@ -76,8 +76,12 @@ def run_comprehensive_optimizer(mode='mim_topo', target_func=cost, epochs=600, l
             pts = np.array(traj[-50:])
             # Topo kick simulation inline based on your code
             try:
+                import warnings
                 from ripser import ripser
-                dgms = ripser(pts, maxdim=1, distance_matrix=False)["dgms"]
+
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    dgms = ripser(pts, maxdim=1, distance_matrix=False)["dgms"]
                 if len(dgms) > 1 and len(dgms[1]) > 0:
                     lifetimes = dgms[1][:, 1] - dgms[1][:, 0]
                     if np.max(lifetimes) > 0.015:
