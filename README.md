@@ -9,7 +9,7 @@
 ## Usage
 Run the main entry point:
 ```bash
-python phase1/main.py
+python main.py
 ```
 
 Run benchmarks:
