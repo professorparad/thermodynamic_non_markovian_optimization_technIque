@@ -11,6 +11,7 @@ def cost(theta : torch.tensor):
     mask = torch.triu(torch.ones(len(theta) , len(theta ) , dtype = torch.bool ,  device = theta.device ) , diagonal = 1 )
     coupling = torch.sum(torch.cos(10.0 * outer[mask])) / len(theta)
     return bowl+ coupling
+
 def cost_np(x: np.ndarray):
     return cost(torch.tensor(x , dtype = torch.float)).item()
 def rastrigin(theta : torch.Tensor):
