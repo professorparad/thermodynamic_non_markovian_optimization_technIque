@@ -14,5 +14,5 @@ python main.py
 
 Run benchmarks:
 ```bash
-python phase1/scripts/run_benchmarks.py
+python scripts/run_benchmarks.py
 ```
