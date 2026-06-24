@@ -1,0 +1,24 @@
+name: Docker CI Pipeline
+
+# Trigger the workflow only when pushing to the test branch
+on:
+  push:
+    branches:
+      - test
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step A: Download your code from the repository
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Step B: Build the Docker container using your Dockerfile
+      - name: Build Docker Image
+        run: docker build -t optimization-app .
+
+      # Step C: Start the container to run the tests
+      - name: Run Tests
+        run: docker run optimization-app
