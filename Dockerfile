@@ -19,4 +19,4 @@ COPY . .
 ENV PYTHONPATH="/app/phase1/project_root"
 
 # 7. Set the default command to run your tests
-CMD ["pytest", "phase1/project_root/tests/"]
+CMD ["python", "-m", "pytest", "phase1/project_root/tests/"]
