@@ -14,28 +14,143 @@ def cost(theta : torch.tensor):
 
 def cost_np(x: np.ndarray):
     return cost(torch.tensor(x , dtype = torch.float)).item()
+
+
+# original code that was present
+''' 
 def rastrigin(theta : torch.Tensor):
     A = 10 
     return A + len(theta) + torch.sum(theta**2 - A* torch.cos(2*np.pi*theta))
+'''
+# ---> new code replaced
+
+def rastrigin(theta):
+    A = 10
+    return A * theta.shape[-1] + torch.sum(
+        theta**2 - A * torch.cos(2 * np.pi * theta),
+        dim=-1
+    )
+
+
+# --> previous implementation
+''' 
 def ackley(theta : torch.Tensor):
     a , b , c = 20 , 0.2  , 2* np.pi 
     d = len(theta )
     sum1 = torch.sum(theta**2)
-    sum2 = torch.sum(torch.cos(c*theta))
+    # sum2 = torch.sum(torch.cos(c*theta))
+
+    sum2 = torch.sum(torch.cos(c*theta), dim=-1)
     term1 = -a * torch.exp(-b* torch.sqrt(sum1 / d ))
     term2 = -torch.exp(sum2/ d)
     return term1 + term2 + a + np.e
+'''
+# ----> newely implemented
+def ackley(theta: torch.Tensor):
+    a, b, c = 20, 0.2, 2 * np.pi
+
+    d = theta.shape[-1]
+
+    sum1 = torch.sum(theta**2, dim=-1)
+    sum2 = torch.sum(torch.cos(c * theta), dim=-1)
+
+    term1 = -a * torch.exp(-b * torch.sqrt(sum1 / d))
+    term2 = -torch.exp(sum2 / d)
+
+    return term1 + term2 + a + np.e
+
+
+'''  --> previous implementation
 def schwefel(theta : torch.Tensor): 
     a , b , c = 20 , 0.2 , 2*np.pi 
     d = len(theta)
     return 418.9829 * d - torch.sum(theta * torch.sin(torch.sqrt(torch.abs(theta))))
+'''
+
+# --> newely implemented
+def schwefel(theta: torch.Tensor):
+    d = theta.shape[-1]
+
+    return (
+        418.9829 * d
+        - torch.sum(
+            theta * torch.sin(torch.sqrt(torch.abs(theta))),
+            dim=-1,
+        )
+    )
+
+
+# ==> previous implementation
+'''
 def griewank(theta : torch.Tensor):
     sum_part = torch.sum(theta**2)/4000
     prod_part = torch.prod(torch.cos(theta / torch.sqrt (torch.arange(1 , len(theta) + 1 , dtype = torch.float64 ))))
     return sum_part - prod_part + 1 
+'''
+
+
+# --> newely implemented
+def griewank(theta: torch.Tensor):
+    idx = torch.arange(
+        1,
+        theta.shape[-1] + 1,
+        dtype=theta.dtype,
+        device=theta.device,
+    )
+
+    sum_part = torch.sum(theta**2, dim=-1) / 4000
+
+    prod_part = torch.prod(
+        torch.cos(theta / torch.sqrt(idx)),
+        dim=-1,
+    )
+
+    return sum_part - prod_part + 1
+
+
+# --> previous implementation
+'''
 def levy(theta : torch.Tensor) : 
     w = 1 + (theta - 1 ) / 4 
     term1 = torch.sin(np.pi * w[0]) ** 2
     term3 = ((w[-1] - 1 ) ** 2 * (1+ torch.sin(2 * np.pi * w[: -1]+ 1 )))
     middle_sum = torch.sum((w[:1] - 1) **2 * (1+ 10 * torch.sin(np.pi * w[:1] +1) **2 ))
     return term1 + middle_sum+term3 
+'''
+
+# --> newlwy implementation
+def levy(theta: torch.Tensor):
+    w = 1 + (theta - 1) / 4
+
+    term1 = torch.sin(np.pi * w[..., 0]) ** 2
+
+    middle_sum = torch.sum(
+        (w[..., 1:-1] - 1) ** 2
+        * (
+            1
+            + 10
+            * torch.sin(np.pi * w[..., 1:-1] + 1) ** 2
+        ),
+        dim=-1,
+    )
+
+    term3 = (
+        (w[..., -1] - 1) ** 2
+        * (1 + torch.sin(2 * np.pi * w[..., -1]) ** 2)
+    )
+
+    return term1 + middle_sum + term3
+
+
+# extra functions added ---> if error will delete
+
+
+def rosenbrock(theta: torch.Tensor):
+    return torch.sum(
+        100 * (theta[..., 1:] - theta[..., :-1] ** 2) ** 2
+        + (1 - theta[..., :-1]) ** 2,
+        dim=-1
+    )
+
+def sphere(theta: torch.Tensor):
+    return torch.sum(theta ** 2, dim=-1)

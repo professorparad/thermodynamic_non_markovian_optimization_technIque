@@ -15,6 +15,7 @@ except ImportError :
 try : 
     from ripser import ripser
     has_risper = True
+    
 except ImportError :
     has_risper = False 
     warnings.warn("ripser not found; topology-escape kicks disabled.", stacklevel=2)
@@ -62,3 +63,82 @@ def _topo_kick(current , pts , current_loss , lambda_topo ):
         lifetimes = dgms[1][: , 1] -dgms[1][: , 0]
         total_p = float(np.sum(lifetimes))
         return np.zeros_like(current) , total_p
+
+
+
+# new additions
+
+def compute_mps_entropy(
+    trajectory: np.ndarray,
+    bond_dim: int = 12,
+) -> float:
+    """
+    Compute mean MPS bond entropy from a trajectory.
+    """
+
+    mps = _build_mps(list(np.asarray(trajectory).ravel()), bond_dim=bond_dim)
+
+    if mps is None:
+        return 0.0
+
+    return float(_mean_bond_entropy(mps))
+
+
+def compute_persistent_homology(
+    trajectory: np.ndarray,
+    maxdim: int = 1,
+):
+    """
+    Compute persistent homology using ripser.
+    """
+
+    trajectory = np.asarray(trajectory)
+
+    if has_risper:
+        return ripser(
+            trajectory,
+            maxdim=maxdim,
+            distance_matrix=False,
+        )
+
+    # fallback when ripser is unavailable
+    return {
+        "dgms": [
+            np.empty((0, 2)),
+            np.empty((0, 2)),
+        ]
+    }
+
+
+def get_topo_force(
+    trajectory: np.ndarray,
+    lambda_topo: float = 0.1,
+    window: int = 5,
+    ndim: int = 2,
+):
+    """
+    Compute topology-based force term.
+    """
+
+    trajectory = np.asarray(trajectory)
+
+    if len(trajectory) == 0:
+        return np.zeros(ndim)
+
+    recent = trajectory[-window:]
+
+    current = recent[-1]
+
+    force, _ = _topo_kick(
+        current=current,
+        pts=recent,
+        current_loss=0.0,
+        lambda_topo=lambda_topo,
+    )
+
+    force = np.asarray(force)
+
+    if force.shape != (ndim,):
+        force = np.zeros(ndim)
+
+    return force

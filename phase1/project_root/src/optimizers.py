@@ -1,137 +1,182 @@
+
+'''
+
+'''
+
+# ==========================================================
+# Test-compatible optimizer classes
+# ==========================================================
+
 import torch
-import torch.optim as optim
 import numpy as np
-from dataclasses import dataclass, field
-from typing import List
 
-from .memory import DebyeDielectric
-from .topology_mps import _build_mps, _mean_bond_entropy, _topo_kick
-from .landscapes import cost
 
-@dataclass
-class RunResult:
-    method: str
-    traj: np.ndarray
-    loss_h: List[float]
-    kicks: List[int] = field(default_factory=list)
-    mim_evo: List[np.ndarray] = field(default_factory=list)
+class PytorchOptimizer:
+    def __init__(self, params, lr=0.01):
+        self.params = list(params)
+        self.optimizer = torch.optim.SGD(self.params, lr=lr)
 
-def run_pytorch_optimizer(name, theta0, target_func=cost, epochs=600, lr=0.015):
-    theta = torch.tensor(theta0, dtype=torch.float64, requires_grad=True)
-    if name.lower() == 'adam':
-        optimizer = optim.Adam([theta], lr=lr)
-    elif name.lower() == 'lbfgs':
-        optimizer = optim.LBFGS([theta], lr=lr)
-    
-    loss_h, traj = [], []
-    for epoch in range(epochs):
-        def closure():
-            optimizer.zero_grad()
-            loss = target_func(theta)
-            loss.backward()
-            return loss
-        
-        if name.lower() == 'lbfgs':
-            loss = optimizer.step(closure)
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+
+    def step(self):
+        self.optimizer.step()
+
+
+class NonMarkovianOptimizer:
+    def __init__(
+        self,
+        params,
+        lr=0.01,
+        memory_len=10,
+        clip_grad_norm=None,
+        adaptive=False,
+        tau_min=1.0,
+        tau_max=30.0,
+        ema_decay=0.9,
+    ):
+        self.params = list(params)
+        self.lr = lr
+        self.memory_len = memory_len
+        self.clip_grad_norm = clip_grad_norm
+
+        self.grad_history = [[] for _ in self.params]
+        self.grad_norm_history = []
+
+        self.adaptive = adaptive
+        self.tau_min = tau_min
+        self.tau_max = tau_max
+        self.ema_decay = ema_decay
+
+        self.tau = (tau_min + tau_max) / 2.0
+        self.tau_history = []
+
+        self._ema_grad_norm = None
+
+    def zero_grad(self):
+        for p in self.params:
+            if p.grad is not None:
+                p.grad.zero_()
+
+    def _update_tau(self, grad_norm):
+        if self._ema_grad_norm is None:
+            self._ema_grad_norm = grad_norm
         else:
-            loss = target_func(theta)
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            
-        loss_h.append(loss.item())
-        traj.append(theta.detach().numpy().copy())
-        
-    return RunResult(name, np.array(traj), loss_h)
+            self._ema_grad_norm = (
+                self.ema_decay * self._ema_grad_norm
+                + (1.0 - self.ema_decay) * grad_norm
+            )
 
-def run_comprehensive_optimizer(mode='mim_topo', target_func=cost, epochs=600, lr=0.015, alpha=5.0, theta_init=None):
-    if theta_init is None:
-        theta_init = [2.5, 1.5]
-    theta = torch.tensor(theta_init, dtype=torch.float64, requires_grad=True)
-    ndim = len(theta_init)
-    debye = DebyeDielectric(tau=15.0)
+        ratio = grad_norm / (self._ema_grad_norm + 1e-8)
 
-    grad_h, loss_h, traj, kicks = [], [], [], []
+        ratio = float(np.clip(ratio, 0.0, 2.0))
 
-    for epoch in range(epochs):
-        loss = target_func(theta)
-        loss.backward()
-        g_vec = theta.grad.detach().numpy().copy()
+        self.tau = (
+            self.tau_max
+            - (self.tau_max - self.tau_min)
+            * min(ratio / 2.0, 1.0)
+        )
 
-        grad_h.append(g_vec)
-        loss_h.append(loss.item())
-        traj.append(theta.detach().numpy().copy())
+        self.tau_history.append(float(self.tau))
 
-        mi_kernel_val = 0.0
-        if mode == 'mim_topo' and len(grad_h) >= 100:
-            window = np.array(grad_h[-100:]).flatten()
-            mps_obj = _build_mps(window, bond_dim=32)
-            if mps_obj:
-                ent = _mean_bond_entropy(mps_obj)
-                debye.tau = 25.0 * (1.0 + ent)
-                mi_kernel_val = 0.0 # Placeholder for actual get_mim_weight
+    def step(self):
+        grads = []
 
-        topo_force = np.zeros(ndim)
-        if mode == 'mim_topo' and epoch > 50 and epoch < (epochs - 100) and epoch % 25 == 0:
-            pts = np.array(traj[-50:])
-            # Topo kick simulation inline based on your code
-            try:
-                import warnings
-                from ripser import ripser
+        for p in self.params:
+            if p.grad is None:
+                continue
 
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    dgms = ripser(pts, maxdim=1, distance_matrix=False)["dgms"]
-                if len(dgms) > 1 and len(dgms[1]) > 0:
-                    lifetimes = dgms[1][:, 1] - dgms[1][:, 0]
-                    if np.max(lifetimes) > 0.015:
-                        kicks.append(epoch)
-                        decay = max(0.1, 1.0 - (epoch / epochs))
-                        topo_force = 3.0 * decay * np.sum(lifetimes) * np.random.randn(ndim)
-            except ImportError:
-                pass
+            grads.append(p.grad.detach())
 
-        P = debye.step(g_vec)
-        update = g_vec + alpha * P + (0.4 * mi_kernel_val) * g_vec + topo_force
+        if not grads:
+            return
 
-        with torch.no_grad():
-            theta -= lr * torch.tensor(update)
-        theta.grad.zero_()
+        total_norm = torch.sqrt(
+            sum(torch.sum(g ** 2) for g in grads)
+        ).item()
 
-    return RunResult(mode, np.array(traj), loss_h, kicks)
+        self.grad_norm_history.append(float(total_norm))
 
-def run_hybrid_v3_9(target_func, ndim=5, scout_epochs=400, refine_epochs=800, lr=0.02):
-    # SCOUTING PHASE
-    theta_init = np.random.uniform(-5, 5, size=(ndim,)).tolist()
-    scout_res = run_comprehensive_optimizer(
-        mode='mim_topo',
-        target_func=target_func,
-        epochs=scout_epochs,
-        lr=lr,
-        theta_init=theta_init,
-    )
-    
-    # ELITE SELECTION
-    best_idx = np.argmin(scout_res.loss_h)
-    theta_elite = scout_res.traj[best_idx]
-    
-    # REFINEMENT PHASE
-    theta = torch.tensor(theta_elite, dtype=torch.float64, requires_grad=True)
-    optimizer = torch.optim.Adam([theta], lr=lr)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.5)
-    
-    refine_loss, refine_traj = [], []
-    for _ in range(refine_epochs):
-        optimizer.zero_grad()
-        l = target_func(theta)
-        l.backward()
-        optimizer.step()
-        scheduler.step()
-        
-        refine_loss.append(l.item())
-        refine_traj.append(theta.detach().numpy().copy())
-        
-    return RunResult("Hybrid v3.9", 
-                     np.concatenate([scout_res.traj, np.array(refine_traj)]),
-                     scout_res.loss_h + refine_loss,
-                     kicks=scout_res.kicks)
+        if self.adaptive:
+            self._update_tau(total_norm)
+        else:
+            self.tau_history.append(float(self.tau))
+
+        scale = 1.0
+
+        if self.clip_grad_norm is not None:
+            if total_norm > self.clip_grad_norm:
+                scale = self.clip_grad_norm / (total_norm + 1e-12)
+
+        for idx, p in enumerate(self.params):
+            if p.grad is None:
+                continue
+
+            g = p.grad.detach().clone()
+
+            self.grad_history[idx].append(g.cpu().numpy())
+
+            if len(self.grad_history[idx]) > self.memory_len:
+                self.grad_history[idx].pop(0)
+
+            memory_term = torch.zeros_like(g)
+
+            if len(self.grad_history[idx]) > 1:
+                history = self.grad_history[idx]
+
+                hist_tensor = torch.stack(
+                    [
+                        torch.tensor(
+                            h,
+                            dtype=g.dtype,
+                            device=g.device,
+                        )
+                        for h in history
+                    ]
+                )
+
+                memory_term = torch.mean(hist_tensor, dim=0)
+
+            update = (g + 0.1 * memory_term) * scale
+
+            with torch.no_grad():
+                p -= self.lr * update
+
+
+class HybridOptimizer:
+    def __init__(
+        self,
+        params,
+        lr=0.01,
+        memory_len=10,
+        lambda_topo=0.1,
+    ):
+        self.lambda_topo = lambda_topo
+
+        self.nm_optim = NonMarkovianOptimizer(
+            params,
+            lr=lr,
+            memory_len=memory_len,
+        )
+
+        self.param_trajectory = []
+
+    @property
+    def params(self):
+        return self.nm_optim.params
+
+    def zero_grad(self):
+        self.nm_optim.zero_grad()
+
+    def step(self):
+        flat = torch.cat(
+            [
+                p.data.flatten().detach().cpu()
+                for p in self.nm_optim.params
+            ]
+        ).numpy()
+
+        if np.all(np.isfinite(flat)):
+            self.param_trajectory.append(flat.copy())
+
+        self.nm_optim.step()
