@@ -42,6 +42,9 @@ def _mps_bond_entropy(mps):
         p /= p.sum()
         ents.append(float(-np.dot(p , np.log2(p))))
     return float(np.mean(ents)) if ents else 0.0 
+
+def _mean_bond_entropy(mps):
+    return _mps_bond_entropy(mps)
     
 def _mutual_info_matrix(mps):
         if mps is None : return np.zeros((1 , 1 ))
@@ -52,7 +55,7 @@ def _mutual_info_matrix(mps):
 def _topo_kick(current , pts , current_loss , lambda_topo ):
         if not has_risper or len(pts) <15 : return np.zeros_like(current) , 0.0 
 
-        dgms = ripser(pts , maxdim = 1 )["dgms"]
+        dgms = ripser(pts , maxdim = 1 , distance_matrix = False)["dgms"]
 
         if len(dgms)< 2 or len(dgms[1]) == 0 : return np.zeros_like(current) , 0.0
 

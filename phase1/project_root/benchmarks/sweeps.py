@@ -1,145 +1,168 @@
-"""
-Benchmark sweep functions.
-Runs statistical replicates and dimension sweeps comparing optimizer variants.
-"""
-
-import time
 import numpy as np
+import pandas as pd
 import torch
-from typing import Callable, Optional
+from scipy.stats import mannwhitneyu
+from pathlib import Path
+import sys
 
-from src.optimizers import PytorchOptimizer, NonMarkovianOptimizer, HybridOptimizer
-from src.landscapes import sphere, rastrigin, ackley, rosenbrock
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
+from src.optimizers import run_pytorch_optimizer, run_hybrid_v3_9
+from src.landscapes import cost, rastrigin, ackley, schwefel, griewank
 
-def _optimize(
-    optimizer_cls: type,
-    landscape_fn: Callable,
-    dim: int,
-    steps: int,
-    lr: float,
-    **kwargs,
-) -> tuple[list[float], float]:
-    """Run a single optimisation trajectory and return (loss_history, final_loss)."""
-    x = torch.randn(dim, requires_grad=True)
-    optim = optimizer_cls([x], lr=lr, **kwargs)
+LANDSCAPES = {
+    "sphere": cost,
+    "rastrigin": rastrigin,
+    "ackley": ackley,
+    "schwefel": schwefel,
+    "griewank": griewank,
+}
 
-    history: list[float] = []
-    for _ in range(steps):
-        optim.zero_grad()
-        loss = landscape_fn(x)
-        loss.backward()
-        optim.step()
-        history.append(loss.item())
+def _landscape(name):
+    try:
+        return LANDSCAPES[name]
+    except KeyError as exc:
+        valid = ", ".join(sorted(LANDSCAPES))
+        raise ValueError(f"Unknown landscape '{name}'. Expected one of: {valid}") from exc
 
-    return history, history[-1]
+def compare_optimizers(landscape="rastrigin", dim=5, steps=200, lr=1e-2):
+    target_func = _landscape(landscape)
+    theta_init = np.random.uniform(-5, 5, size=(dim,))
 
+    adam = run_pytorch_optimizer(
+        "Adam",
+        theta_init.tolist(),
+        target_func=target_func,
+        epochs=steps,
+        lr=lr,
+    )
+    hybrid = run_hybrid_v3_9(
+        target_func,
+        ndim=dim,
+        scout_epochs=max(1, steps // 2),
+        refine_epochs=max(1, steps - (steps // 2)),
+        lr=lr,
+    )
 
-def run_statistical_sweep(
-    landscape: str = "rastrigin",
-    dim: int = 5,
-    steps: int = 200,
-    lr: float = 1e-2,
-    n_trials: int = 20,
-    seed: int = 42,
-) -> dict[str, dict[str, float]]:
-    """
-    Run multiple trials for each optimizer and return summary statistics.
-
-    Returns
-    -------
-    dict of {optimizer_name: {"mean", "std", "min", "final_mean", ...}}
-    """
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    landscapes = {
-        "sphere": sphere,
-        "rastrigin": rastrigin,
-        "ackley": ackley,
-        "rosenbrock": rosenbrock,
+    return {
+        adam.method: adam.loss_h,
+        hybrid.method: hybrid.loss_h,
     }
-    fn = landscapes.get(landscape, rastrigin)
 
-    optim_configs: list[tuple[str, type, dict]] = [
-        ("PytorchAdam", PytorchOptimizer, {}),
-        ("NonMarkovian", NonMarkovianOptimizer, {"memory_len": 20, "tau": 15.0}),
-        ("Hybrid", HybridOptimizer, {"memory_len": 20, "tau": 15.0, "lambda_topo": 0.1}),
-    ]
+def run_statistical_sweep(landscape="rastrigin", dim=5, steps=200, lr=1e-2, n_trials=10, seed=42):
+    finals = {"Adam": [], "Hybrid v3.9": []}
 
-    results: dict[str, dict[str, float]] = {}
-    for name, cls, kwargs in optim_configs:
-        histories: list[list[float]] = []
-        final_losses: list[float] = []
-        times: list[float] = []
+    for trial in range(n_trials):
+        np.random.seed(seed + trial)
+        torch.manual_seed(seed + trial)
+        histories = compare_optimizers(landscape=landscape, dim=dim, steps=steps, lr=lr)
+        for name, hist in histories.items():
+            finals[name].append(hist[-1])
 
-        for _ in range(n_trials):
-            t0 = time.perf_counter()
-            hist, final = _optimize(cls, fn, dim, steps, lr, **kwargs)
-            elapsed = time.perf_counter() - t0
-            histories.append(hist)
-            final_losses.append(final)
-            times.append(elapsed)
+    return {
+        name: {
+            "mean_final": float(np.mean(values)),
+            "std_final": float(np.std(values)),
+            "min_final": float(np.min(values)),
+            "max_final": float(np.max(values)),
+        }
+        for name, values in finals.items()
+    }
 
-        results[name] = {
-            "mean_final": float(np.mean(final_losses)),
-            "std_final": float(np.std(final_losses)),
-            "min_final": float(np.min(final_losses)),
-            "mean_time": float(np.mean(times)),
-            "mean_loss_over_steps": float(np.mean([np.mean(h) for h in histories])),
+def run_dimension_sweep(landscape="rastrigin", dims=None, steps=200, lr=1e-2, n_trials=10):
+    if dims is None:
+        dims = [2, 5, 10, 20, 50]
+
+    results = {}
+    for dim in dims:
+        stats = run_statistical_sweep(
+            landscape=landscape,
+            dim=dim,
+            steps=steps,
+            lr=lr,
+            n_trials=n_trials,
+        )
+        results[dim] = {
+            f"{name}_mean_final": values["mean_final"]
+            for name, values in stats.items()
         }
 
     return results
 
+def run_statistical_validation(dimensions=[10, 20, 50], trials=30):
+    test_funcs = [rastrigin, ackley]
+    detailed_stats = []
 
-def run_dimension_sweep(
-    landscape: str = "rastrigin",
-    dims: list[int] = None,
-    steps: int = 200,
-    lr: float = 1e-2,
-    n_trials: int = 10,
-) -> dict[int, dict[str, float]]:
-    """Run statistical sweeps across multiple dimensions."""
-    if dims is None:
-        dims = [2, 5, 10, 20, 50]
+    for dim in dimensions:
+        for f in test_funcs:
+            print(f"\n>>> Testing {f.__name__.upper()} in {dim}D...")
+            adam_finals, hybrid_finals = [], []
+            
+            for t in range(trials):
+                np.random.seed(t)
+                torch.manual_seed(t)
+                theta_init = np.random.uniform(-5, 5, size=(dim,))
 
-    results: dict[int, dict[str, float]] = {}
-    for d in dims:
-        sweep = run_statistical_sweep(
-            landscape=landscape, dim=d, steps=steps, lr=lr, n_trials=n_trials
-        )
-        # Flatten to {optimizer_key: mean_final}
-        flat = {f"{k}_mean_final": v["mean_final"] for k, v in sweep.items()}
-        results[d] = flat
+                res_a = run_pytorch_optimizer('Adam', theta_init.tolist(), target_func=f, epochs=1200, lr=0.02)
+                adam_finals.append(res_a.loss_h[-1])
 
-    return results
+                res_h = run_hybrid_v3_9(f, ndim=dim, scout_epochs=400, refine_epochs=800, lr=0.02)
+                hybrid_finals.append(res_h.loss_h[-1])
 
+            u_stat, p_val = mannwhitneyu(adam_finals, hybrid_finals)
+            
+            detailed_stats.append({
+                'Dimension': dim,
+                'Function': f.__name__,
+                'Adam Mean': np.mean(adam_finals),
+                'Adam Std': np.std(adam_finals),
+                'Hybrid Mean': np.mean(hybrid_finals),
+                'Hybrid Std': np.std(hybrid_finals),
+                'P-Value': p_val,
+                'Avg Gain (%)': ((np.mean(adam_finals) - np.mean(hybrid_finals)) / (np.mean(adam_finals) + 1e-9)) * 100
+            })
+            
+    return pd.DataFrame(detailed_stats)
 
-def compare_optimizers(
-    landscape: str = "rastrigin",
-    dim: int = 5,
-    steps: int = 200,
-    lr: float = 1e-2,
-) -> dict[str, list[float]]:
-    """Return per-step loss histories for a single run of each optimizer."""
-    torch.manual_seed(0)
-    np.random.seed(0)
+def run_publication_sweep(dimensions=[10, 20, 50], trials=30):
+    test_funcs = [rastrigin, ackley, schwefel, griewank]
+    detailed_stats = []
 
-    landscapes = {
-        "sphere": sphere,
-        "rastrigin": rastrigin,
-        "ackley": ackley,
-        "rosenbrock": rosenbrock,
-    }
-    fn = landscapes.get(landscape, rastrigin)
+    for dim in dimensions:
+        for f in test_funcs:
+            print(f"\n>>> Processing {f.__name__.upper()} ({dim}D)...", end=" ")
+            a_finals, h_finals = [], []
 
-    results: dict[str, list[float]] = {}
-    for name, cls, kwargs in [
-        ("PytorchAdam", PytorchOptimizer, {}),
-        ("NonMarkovian", NonMarkovianOptimizer, {"memory_len": 20, "tau": 15.0}),
-        ("Hybrid", HybridOptimizer, {"memory_len": 20, "tau": 15.0, "lambda_topo": 0.1}),
-    ]:
-        hist, _ = _optimize(cls, fn, dim, steps, lr, **kwargs)
-        results[name] = hist
+            for t in range(trials):
+                current_seed = t + 1000 * dim + (test_funcs.index(f) * 100)
+                np.random.seed(current_seed)
+                torch.manual_seed(current_seed)
+                
+                init_range = 500 if f.__name__ == 'schwefel' else 5
+                theta_init = np.random.uniform(-init_range, init_range, size=(dim,))
 
-    return results
+                res_a = run_pytorch_optimizer('Adam', theta_init.tolist(), target_func=f, epochs=1200, lr=0.02)
+                a_finals.append(res_a.loss_h[-1])
+
+                res_h = run_hybrid_v3_9(f, ndim=dim, scout_epochs=400, refine_epochs=800, lr=0.02)
+                h_finals.append(res_h.loss_h[-1])
+            
+            u_stat, p_val = mannwhitneyu(a_finals, h_finals)
+            
+            detailed_stats.append({
+                'Dimension': dim,
+                'Function': f.__name__,
+                'Adam Mean': np.mean(a_finals),
+                'Adam Std': np.std(a_finals),
+                'Hybrid Mean': np.mean(h_finals),
+                'Hybrid Std': np.std(h_finals),
+                'P-Value': p_val,
+                'Gain (%)': ((np.mean(a_finals) - np.mean(h_finals)) / (np.mean(a_finals) + 1e-9)) * 100,
+                'All_Adam': a_finals,
+                'All_Hybrid': h_finals
+            })
+            print("Done.")
+
+    return pd.DataFrame(detailed_stats)

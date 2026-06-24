@@ -77,7 +77,7 @@ def run_comprehensive_optimizer(mode='mim_topo', target_func=cost, epochs=600, l
             # Topo kick simulation inline based on your code
             try:
                 from ripser import ripser
-                dgms = ripser(pts, maxdim=1)["dgms"]
+                dgms = ripser(pts, maxdim=1, distance_matrix=False)["dgms"]
                 if len(dgms) > 1 and len(dgms[1]) > 0:
                     lifetimes = dgms[1][:, 1] - dgms[1][:, 0]
                     if np.max(lifetimes) > 0.015:
@@ -98,7 +98,14 @@ def run_comprehensive_optimizer(mode='mim_topo', target_func=cost, epochs=600, l
 
 def run_hybrid_v3_9(target_func, ndim=5, scout_epochs=400, refine_epochs=800, lr=0.02):
     # SCOUTING PHASE
-    scout_res = run_comprehensive_optimizer(mode='mim_topo', target_func=target_func, epochs=scout_epochs, lr=lr)
+    theta_init = np.random.uniform(-5, 5, size=(ndim,)).tolist()
+    scout_res = run_comprehensive_optimizer(
+        mode='mim_topo',
+        target_func=target_func,
+        epochs=scout_epochs,
+        lr=lr,
+        theta_init=theta_init,
+    )
     
     # ELITE SELECTION
     best_idx = np.argmin(scout_res.loss_h)

@@ -1,23 +1,61 @@
-"""
-Plotting utilities for benchmark results.
-Uses matplotlib and seaborn for publication-quality figures.
-"""
-
-import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from typing import Optional
+import pandas as pd
+import numpy as np
 
-sns.set_theme(style="whitegrid", palette="muted")
+def plot_publication_sweep(final_stats_df: pd.DataFrame, save_path=None):
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+    # 1. Performance Gain Scaling
+    sns.lineplot(data=final_stats_df, x='Dimension', y='Gain (%)', hue='Function', marker='o', ax=axes[0,0])
+    axes[0,0].set_title("A. Average Performance Gain (%) vs. Dimensionality")
+    axes[0,0].grid(True, alpha=0.3)
+
+    # 2. Statistical Significance (Log P-Value)
+    final_stats_df['log_p'] = np.log10(final_stats_df['P-Value'] + 1e-20)
+    sns.barplot(data=final_stats_df, x='Dimension', y='log_p', hue='Function', ax=axes[0,1])
+    axes[0,1].axhline(np.log10(0.05), color='red', linestyle='--', label='p=0.05')
+    axes[0,1].set_title("B. Statistical Significance (Log10 P-Value)")
+    axes[0,1].set_ylabel("Log10(p)")
+
+    # 3. Variance Distribution (Boxplots for the highest available dimension)
+    target_dim = int(final_stats_df["Dimension"].max())
+    data_50d = final_stats_df[final_stats_df['Dimension'] == target_dim]
+    box_data = []
+    for _, row in data_50d.iterrows():
+        for val in row['All_Hybrid']:
+            box_data.append({'Function': row['Function'], 'Loss': val, 'Optimizer': 'Hybrid'})
+        for val in row['All_Adam']:
+            box_data.append({'Function': row['Function'], 'Loss': val, 'Optimizer': 'Adam'})
+
+    sns.boxplot(data=pd.DataFrame(box_data), x='Function', y='Loss', hue='Optimizer', ax=axes[1,0])
+    axes[1,0].set_yscale('log')
+    axes[1,0].set_title(f"C. Loss Distribution at {target_dim}D (Log Scale)")
+
+    # 4. Hybrid Std Deviation Check
+    sns.scatterplot(data=final_stats_df, x='Dimension', y='Hybrid Std', hue='Function', ax=axes[1,1])
+    axes[1,1].set_yscale('log')
+    axes[1,1].set_title("D. Hybrid Optimizer Stability (Standard Deviation)")
+
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+def plot_convergence(adam_loss, hybrid_loss, function_name: str):
+    plt.figure(figsize=(10, 3))
+    plt.plot(adam_loss, label='Adam', alpha=0.5)
+    plt.plot(hybrid_loss, label='Hybrid v3.9', linewidth=2)
+    plt.title(f"Convergence: {function_name}")
+    plt.yscale('log')
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True, which='both', alpha=0.2)
+    plt.show()
 
 
-def plot_loss_curves(
-    histories: dict[str, list[float]],
-    title: str = "Optimization Loss Curves",
-    figsize: tuple[int, int] = (10, 6),
-    save_path: Optional[str] = None,
-) -> plt.Figure:
-    """Plot per-step loss for each optimizer."""
+def plot_loss_curves(histories, title="Optimization Loss Curves", figsize=(10, 6), save_path=None):
     fig, ax = plt.subplots(figsize=figsize)
     for name, hist in histories.items():
         ax.plot(hist, label=name, linewidth=1.5)
@@ -30,63 +68,38 @@ def plot_loss_curves(
     return fig
 
 
-def plot_statistical_comparison(
-    stats: dict[str, dict[str, float]],
-    metric: str = "mean_final",
-    title: str = "Statistical Comparison (mean final loss)",
-    figsize: tuple[int, int] = (8, 5),
-    save_path: Optional[str] = None,
-) -> plt.Figure:
-    """Bar plot comparing a metric across optimizers with error bars (std)."""
+def plot_statistical_comparison(stats, metric="mean_final", title="Statistical Comparison", figsize=(8, 5), save_path=None):
     names = list(stats.keys())
     means = [stats[n].get(metric, 0) for n in names]
     stds = [stats[n].get("std_final", 0) for n in names]
-
     fig, ax = plt.subplots(figsize=figsize)
-    bars = ax.bar(names, means, yerr=stds, capsize=5, color=sns.color_palette("muted", len(names)))
+    ax.bar(names, means, yerr=stds, capsize=5)
     ax.set_ylabel(metric.replace("_", " ").title())
     ax.set_title(title)
-    for bar, val in zip(bars, means):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{val:.3f}",
-                ha="center", va="bottom", fontsize=9)
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
     return fig
 
 
-def plot_dimension_sweep(
-    sweep_data: dict[int, dict[str, float]],
-    title: str = "Dimension Sweep",
-    figsize: tuple[int, int] = (10, 6),
-    save_path: Optional[str] = None,
-) -> plt.Figure:
-    """Line plot showing how final loss scales with dimension for each optimizer."""
+def plot_dimension_sweep(sweep_data, title="Dimension Sweep", figsize=(10, 6), save_path=None):
     dims = sorted(sweep_data.keys())
     optim_keys = set()
     for v in sweep_data.values():
         optim_keys.update(v.keys())
-
     fig, ax = plt.subplots(figsize=figsize)
     for key in sorted(optim_keys):
         vals = [sweep_data[d].get(key, np.nan) for d in dims]
-        ax.plot(dims, vals, marker="o", label=key.replace("_mean_final", ""), linewidth=1.5)
+        ax.plot(dims, vals, marker="o", label=key, linewidth=1.5)
     ax.set_xlabel("Dimension")
     ax.set_ylabel("Mean Final Loss")
     ax.set_title(title)
     ax.legend()
-    ax.set_xscale("log", base=2)
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
     return fig
 
 
-def plot_trajectory(
-    trajectory: np.ndarray,
-    title: str = "Parameter Trajectory (first 2 dims)",
-    figsize: tuple[int, int] = (7, 7),
-    save_path: Optional[str] = None,
-) -> plt.Figure:
-    """Scatter/line plot of the first two dimensions of an optimisation trajectory."""
+def plot_trajectory(trajectory, title="Parameter Trajectory (first 2 dims)", figsize=(7, 7), save_path=None):
     fig, ax = plt.subplots(figsize=figsize)
     ax.plot(trajectory[:, 0], trajectory[:, 1], "o-", markersize=3, linewidth=1, alpha=0.8)
     ax.scatter(trajectory[0, 0], trajectory[0, 1], c="green", s=80, label="Start", zorder=5)
