@@ -9,10 +9,10 @@
 ## Usage
 Run the main entry point:
 ```bash
-python main.py
+python phase1/main.py
 ```
 
 Run benchmarks:
 ```bash
-python scripts/run_benchmarks.py
+python phase1/scripts/run_benchmarks.py
 ```
