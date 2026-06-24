@@ -2,99 +2,60 @@
 Topological and MPS (Matrix Product State) utilities.
 Compute persistent homology and MPS entanglement entropy from optimization trajectories.
 """
-
 import torch
+import warnings 
+from typing import List  , Optional 
 import numpy as np
-from ripser import ripser
-import quimb.tensor as qtn
+try : 
+    import quimb.tensor as qtn 
+    HAS_QUIMB = True 
+except ImportError : 
+    HAS_QUIMB = False 
+    warnings.warn("quimb not found " , stacklevel = 2)
+try : 
+    from ripser import ripser
+    has_risper = True
+except ImportError :
+    has_risper = False 
+    warnings.warn("ripser not found; topology-escape kicks disabled.", stacklevel=2)
 
-
-def compute_mps_entropy(
-    history: list | np.ndarray,
-    bond_dim: int = 32,
-) -> float:
-    """
-    Convert a 1D trajectory history into a Matrix Product State and compute
-    the average entanglement entropy across bipartitions.
-
-    Parameters
-    ----------
-    history : list or np.ndarray
-        Flattenable 1D trajectory of loss / parameter values.
-    bond_dim : int
-        Maximum bond dimension for MPS compression.
-
-    Returns
-    -------
-    float
-        Mean entanglement entropy.
-    """
-    x = np.array(history).flatten()
+def _build_mps (history : List[float] , bond_dim : int = 12):
+    if not HAS_QUIMB : return None 
+    x = np.asarray(history , dtype = float)
     n = int(np.floor(np.log2(len(x))))
-    if n < 1:
-        return 0.0
-    vec = x[: 2**n]
-    mps = qtn.MatrixProductState.from_dense(
-        vec / (np.linalg.norm(vec) + 1e-12), [2] * n
-    )
-    mps.compress(max_bond=bond_dim)
-    return float(np.mean([mps.entropy(i) for i in range(1, mps.L)]))
+    if n < 1 : return None 
+    x = x[: 2 ** n ]
+    norm = np.linalg.norm(x)
+    if norm < 1e-12 : return None 
+    x = x[: 2 ** n ]
+    norm = np.linalg.norm(x)
+    if norm < 1e-12 : return None
+    mps = qtn.MatrixProductState.from_dense(x / norm , [2] * n )
+    return mps 
 
+def _mps_bond_entropy(mps):
+    if mps is None : return 0.0 
+    ents = []
+    for i in range(1 , mps.L):
+        sv = mps.schmidt_values(i)
+        p = sv[sv > 1e-12 ]**2
+        p /= p.sum()
+        ents.append(float(-np.dot(p , np.log2(p))))
+    return float(np.mean(ents)) if ents else 0.0 
+    
+def _mutual_info_matrix(mps):
+        if mps is None : return np.zeros((1 , 1 ))
+        L = mps.L 
+        mim = np.zeros((L , L ))
+        return mim 
 
-def compute_persistent_homology(
-    trajectory: np.ndarray,
-    maxdim: int = 1,
-) -> dict:
-    """
-    Compute persistent homology of a trajectory point cloud.
+def _topo_kick(current , pts , current_loss , lambda_topo ):
+        if not has_risper or len(pts) <15 : return np.zeros_like(current) , 0.0 
 
-    Parameters
-    ----------
-    trajectory : np.ndarray of shape (T, D)
-        Sequence of D-dimensional points visited during optimisation.
-    maxdim : int
-        Maximum homology dimension to compute.
+        dgms = ripser(pts , maxdim = 1 )["dgms"]
 
-    Returns
-    -------
-    dict
-        ripser output dictionary with keys 'dgms' (list of diagrams).
-    """
-    return ripser(trajectory, maxdim=maxdim)
+        if len(dgms)< 2 or len(dgms[1]) == 0 : return np.zeros_like(current) , 0.0
 
-
-def get_topo_force(
-    trajectory: np.ndarray,
-    lambda_topo: float = 0.1,
-    window: int = 50,
-    ndim: int = 1,
-    seed: int | None = None,
-) -> np.ndarray:
-    """
-    Compute a topological force that pushes the optimiser away from
-    topologically simple regions (low persistent homology lifetimes).
-
-    Parameters
-    ----------
-    trajectory : np.ndarray of shape (T, D)
-    lambda_topo : float
-        Strength of the topological regularisation.
-    window : int
-        Number of most recent points to use.
-    ndim : int
-        Dimensionality of the force vector (matches parameter space).
-    seed : int or None
-        Random seed for reproducibility.
-
-    Returns
-    -------
-    np.ndarray of shape (ndim,)
-        Random perturbation weighted by topological lifetimes.
-    """
-    pts = np.array(trajectory[-window:])
-    dgms = ripser(pts, maxdim=1)["dgms"]
-    if len(dgms) > 1 and len(dgms[1]) > 0:
-        lifetimes = dgms[1][:, 1] - dgms[1][:, 0]
-        rng = np.random.default_rng(seed)
-        return lambda_topo * float(np.sum(lifetimes)) * rng.standard_normal(ndim)
-    return np.zeros(ndim)
+        lifetimes = dgms[1][: , 1] -dgms[1][: , 0]
+        total_p = float(np.sum(lifetimes))
+        return np.zeros_like(current) , total_p

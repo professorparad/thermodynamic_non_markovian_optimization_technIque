@@ -1,185 +1,126 @@
-"""
-Optimizer implementations: standard PyTorch, non-Markovian (memory-based),
-and hybrid (memory + topological regularisation).
-"""
-
 import torch
 import torch.optim as optim
 import numpy as np
+from dataclasses import dataclass, field
+from typing import List
 
 from .memory import DebyeDielectric
-from .topology_mps import compute_mps_entropy, get_topo_force
+from .topology_mps import _build_mps, _mean_bond_entropy, _topo_kick
+from .landscapes import cost
 
+@dataclass
+class RunResult:
+    method: str
+    traj: np.ndarray
+    loss_h: List[float]
+    kicks: List[int] = field(default_factory=list)
+    mim_evo: List[np.ndarray] = field(default_factory=list)
 
-class PytorchOptimizer:
-    """
-    Thin wrapper around a standard PyTorch optimizer (Adam by default).
-    Used as the baseline in comparisons.
-    """
+def run_pytorch_optimizer(name, theta0, target_func=cost, epochs=600, lr=0.015):
+    theta = torch.tensor(theta0, dtype=torch.float64, requires_grad=True)
+    if name.lower() == 'adam':
+        optimizer = optim.Adam([theta], lr=lr)
+    elif name.lower() == 'lbfgs':
+        optimizer = optim.LBFGS([theta], lr=lr)
+    
+    loss_h, traj = [], []
+    for epoch in range(epochs):
+        def closure():
+            optimizer.zero_grad()
+            loss = target_func(theta)
+            loss.backward()
+            return loss
+        
+        if name.lower() == 'lbfgs':
+            loss = optimizer.step(closure)
+        else:
+            loss = target_func(theta)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            
+        loss_h.append(loss.item())
+        traj.append(theta.detach().numpy().copy())
+        
+    return RunResult(name, np.array(traj), loss_h)
 
-    def __init__(
-        self,
-        params: list[torch.Tensor],
-        lr: float = 1e-2,
-        optimizer_cls: type = optim.Adam,
-        **kwargs,
-    ):
-        self.optimizer = optimizer_cls(params, lr=lr, **kwargs)
+def run_comprehensive_optimizer(mode='mim_topo', target_func=cost, epochs=600, lr=0.015, alpha=5.0, theta_init=None):
+    if theta_init is None:
+        theta_init = [2.5, 1.5]
+    theta = torch.tensor(theta_init, dtype=torch.float64, requires_grad=True)
+    ndim = len(theta_init)
+    debye = DebyeDielectric(tau=15.0)
 
-    def step(self) -> None:
-        self.optimizer.step()
+    grad_h, loss_h, traj, kicks = [], [], [], []
 
-    def zero_grad(self) -> None:
-        self.optimizer.zero_grad()
+    for epoch in range(epochs):
+        loss = target_func(theta)
+        loss.backward()
+        g_vec = theta.grad.detach().numpy().copy()
 
-    @property
-    def param_groups(self):
-        return self.optimizer.param_groups
+        grad_h.append(g_vec)
+        loss_h.append(loss.item())
+        traj.append(theta.detach().numpy().copy())
 
-    def state_dict(self):
-        return self.optimizer.state_dict()
+        mi_kernel_val = 0.0
+        if mode == 'mim_topo' and len(grad_h) >= 100:
+            window = np.array(grad_h[-100:]).flatten()
+            mps_obj = _build_mps(window, bond_dim=32)
+            if mps_obj:
+                ent = _mean_bond_entropy(mps_obj)
+                debye.tau = 25.0 * (1.0 + ent)
+                mi_kernel_val = 0.0 # Placeholder for actual get_mim_weight
 
-    def load_state_dict(self, state_dict) -> None:
-        self.optimizer.load_state_dict(state_dict)
+        topo_force = np.zeros(ndim)
+        if mode == 'mim_topo' and epoch > 50 and epoch < (epochs - 100) and epoch % 25 == 0:
+            pts = np.array(traj[-50:])
+            # Topo kick simulation inline based on your code
+            try:
+                from ripser import ripser
+                dgms = ripser(pts, maxdim=1)["dgms"]
+                if len(dgms) > 1 and len(dgms[1]) > 0:
+                    lifetimes = dgms[1][:, 1] - dgms[1][:, 0]
+                    if np.max(lifetimes) > 0.015:
+                        kicks.append(epoch)
+                        decay = max(0.1, 1.0 - (epoch / epochs))
+                        topo_force = 3.0 * decay * np.sum(lifetimes) * np.random.randn(ndim)
+            except ImportError:
+                pass
 
+        P = debye.step(g_vec)
+        update = g_vec + alpha * P + (0.4 * mi_kernel_val) * g_vec + topo_force
 
-class NonMarkovianOptimizer:
-    """
-    Optimizer with a non-Markovian update that convolves gradient history
-    with a memory kernel (Debye dielectric relaxation).
+        with torch.no_grad():
+            theta -= lr * torch.tensor(update)
+        theta.grad.zero_()
 
-    The effective update at step t is:
-        Δθ_t = -η * Σ_{k=0}^{K} w_k * g_{t-k}
-    where w_k are normalised kernel weights and g_t are past gradients.
-    """
+    return RunResult(mode, np.array(traj), loss_h, kicks)
 
-    def __init__(
-        self,
-        params: list[torch.Tensor],
-        lr: float = 1e-2,
-        memory_len: int = 20,
-        tau: float = 15.0,
-        alpha: float = 5.0,
-    ):
-        self.params = list(params)
-        self.lr = lr
-        self.memory_len = memory_len
-        self.kernel = DebyeDielectric(tau=tau, alpha=alpha)
-
-        # Gradient history: list of lists, one per parameter group
-        self.grad_history: list[list[torch.Tensor]] = [[] for _ in self.params]
-
-    def step(self) -> None:
-        for i, p in enumerate(self.params):
-            if p.grad is None:
-                continue
-
-            # Store current gradient
-            self.grad_history[i].append(p.grad.detach().clone())
-            if len(self.grad_history[i]) > self.memory_len:
-                self.grad_history[i].pop(0)
-
-            # Compute weighted sum of past gradients
-            n = len(self.grad_history[i])
-            if n < 2:
-                effective_grad = self.grad_history[i][-1]
-            else:
-                w = self.kernel.weights(n, device=p.device)
-                effective_grad = torch.zeros_like(p.grad)
-                for k, g in enumerate(self.grad_history[i]):
-                    effective_grad += w[k] * g
-
-            p.data.add_(-self.lr * effective_grad)
-
-    def zero_grad(self) -> None:
-        for p in self.params:
-            if p.grad is not None:
-                p.grad.zero_()
-
-    def state_dict(self) -> dict:
-        return {
-            "lr": self.lr,
-            "memory_len": self.memory_len,
-            "tau": self.kernel.tau,
-            "alpha": self.kernel.alpha,
-        }
-
-    def load_state_dict(self, state_dict: dict) -> None:
-        self.lr = state_dict["lr"]
-        self.memory_len = state_dict["memory_len"]
-        self.kernel.tau = state_dict["tau"]
-        self.kernel.alpha = state_dict["alpha"]
-
-
-class HybridOptimizer:
-    """
-    Combines non-Markovian memory updates with topological regularisation
-    from persistent homology of the parameter trajectory.
-
-    The update is:
-        Δθ = Δθ_{non-markov} + λ_topo * F_topo
-    where F_topo is a random perturbation scaled by topological feature lifetimes.
-    """
-
-    def __init__(
-        self,
-        params: list[torch.Tensor],
-        lr: float = 1e-2,
-        memory_len: int = 20,
-        tau: float = 15.0,
-        alpha: float = 5.0,
-        lambda_topo: float = 0.1,
-        topo_window: int = 50,
-    ):
-        self.nm_optim = NonMarkovianOptimizer(
-            params, lr=lr, memory_len=memory_len, tau=tau, alpha=alpha
-        )
-        self.lambda_topo = lambda_topo
-        self.topo_window = topo_window
-        self.param_trajectory: list[np.ndarray] = []
-        self._step_count = 0
-
-    def step(self) -> None:
-        self.nm_optim.step()
-
-        # Record current parameters for topology
-        flat_params = torch.cat([p.data.flatten().detach().cpu() for p in self.nm_optim.params]).numpy()
-        self.param_trajectory.append(flat_params)
-        if len(self.param_trajectory) > self.topo_window:
-            self.param_trajectory.pop(0)
-
-        # Apply topological force every 5 steps once we have enough history
-        self._step_count += 1
-        if (
-            self._step_count % 5 == 0
-            and len(self.param_trajectory) >= 20
-            and self.lambda_topo > 0
-        ):
-            traj_array = np.stack(self.param_trajectory)
-            ndim = sum(p.numel() for p in self.nm_optim.params)
-            force = get_topo_force(traj_array, lambda_topo=self.lambda_topo, ndim=ndim)
-
-            # Distribute force across parameters
-            idx = 0
-            for p in self.nm_optim.params:
-                numel = p.numel()
-                p.data.add_(
-                    torch.tensor(force[idx : idx + numel], dtype=p.dtype, device=p.device).reshape(p.shape)
-                )
-                idx += numel
-
-    def zero_grad(self) -> None:
-        self.nm_optim.zero_grad()
-
-    def state_dict(self) -> dict:
-        d = self.nm_optim.state_dict()
-        d["lambda_topo"] = self.lambda_topo
-        d["topo_window"] = self.topo_window
-        d["step_count"] = self._step_count
-        return d
-
-    def load_state_dict(self, state_dict: dict) -> None:
-        self.nm_optim.load_state_dict(state_dict)
-        self.lambda_topo = state_dict.get("lambda_topo", self.lambda_topo)
-        self.topo_window = state_dict.get("topo_window", self.topo_window)
-        self._step_count = state_dict.get("step_count", 0)
+def run_hybrid_v3_9(target_func, ndim=5, scout_epochs=400, refine_epochs=800, lr=0.02):
+    # SCOUTING PHASE
+    scout_res = run_comprehensive_optimizer(mode='mim_topo', target_func=target_func, epochs=scout_epochs, lr=lr)
+    
+    # ELITE SELECTION
+    best_idx = np.argmin(scout_res.loss_h)
+    theta_elite = scout_res.traj[best_idx]
+    
+    # REFINEMENT PHASE
+    theta = torch.tensor(theta_elite, dtype=torch.float64, requires_grad=True)
+    optimizer = torch.optim.Adam([theta], lr=lr)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.5)
+    
+    refine_loss, refine_traj = [], []
+    for _ in range(refine_epochs):
+        optimizer.zero_grad()
+        l = target_func(theta)
+        l.backward()
+        optimizer.step()
+        scheduler.step()
+        
+        refine_loss.append(l.item())
+        refine_traj.append(theta.detach().numpy().copy())
+        
+    return RunResult("Hybrid v3.9", 
+                     np.concatenate([scout_res.traj, np.array(refine_traj)]),
+                     scout_res.loss_h + refine_loss,
+                     kicks=scout_res.kicks)

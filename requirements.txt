@@ -3,3 +3,4 @@ torch>=2.0.0
 quimb>=1.4.0
 ripser>=0.6.0
 matplotlib>=3.7.0
+seaborn 
