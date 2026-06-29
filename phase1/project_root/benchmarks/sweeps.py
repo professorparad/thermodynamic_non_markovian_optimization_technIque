@@ -9,8 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.optimizers import run_pytorch_optimizer, run_hybrid_v3_9
+from src.optimizers import run_pytorch_optimizer, run_hybrid_v3_9, run_global_hybrid_optimizer
 from src.landscapes import cost, rastrigin, ackley, schwefel, griewank
+from src.topology_mps import _build_mps
 
 LANDSCAPES = {
     "sphere": cost,
@@ -20,6 +21,14 @@ LANDSCAPES = {
     "griewank": griewank,
 }
 
+KNOWN_MINIMA = {
+    "ackley": 0.0,
+    "griewank": 0.0,
+    "rastrigin": 0.0,
+    "schwefel": 0.0,
+    "sphere": None,
+}
+
 def _landscape(name):
     try:
         return LANDSCAPES[name]
@@ -27,9 +36,35 @@ def _landscape(name):
         valid = ", ".join(sorted(LANDSCAPES))
         raise ValueError(f"Unknown landscape '{name}'. Expected one of: {valid}") from exc
 
-def compare_optimizers(landscape="rastrigin", dim=5, steps=200, lr=1e-2):
+def _init_range(landscape):
+    return 500.0 if landscape == "schwefel" else 5.0
+
+
+def _reconstruction_error(history, bond_dim=24):
+    values = np.asarray(history, dtype=float)
+    if values.size < 4:
+        return np.nan
+    n = int(np.floor(np.log2(values.size)))
+    signal = values[: 2 ** n]
+    signal = signal - np.min(signal)
+    norm = np.linalg.norm(signal)
+    if norm < 1e-12:
+        return 0.0
+    target = signal / norm
+    mps = _build_mps(target, bond_dim=bond_dim)
+    if mps is None:
+        return np.nan
+    try:
+        recon = np.asarray(mps.to_dense(), dtype=float).reshape(-1)
+    except AttributeError:
+        return np.nan
+    return float(np.linalg.norm(target - recon[: target.size]) / (np.linalg.norm(target) + 1e-12))
+
+
+def compare_optimizers(landscape="rastrigin", dim=5, steps=200, lr=1e-2, device="auto", starts=8):
     target_func = _landscape(landscape)
-    theta_init = np.random.uniform(-5, 5, size=(dim,))
+    init_range = _init_range(landscape)
+    theta_init = np.random.uniform(-init_range, init_range, size=(dim,))
 
     adam = run_pytorch_optimizer(
         "Adam",
@@ -37,6 +72,7 @@ def compare_optimizers(landscape="rastrigin", dim=5, steps=200, lr=1e-2):
         target_func=target_func,
         epochs=steps,
         lr=lr,
+        device=device,
     )
     hybrid = run_hybrid_v3_9(
         target_func,
@@ -44,20 +80,82 @@ def compare_optimizers(landscape="rastrigin", dim=5, steps=200, lr=1e-2):
         scout_epochs=max(1, steps // 2),
         refine_epochs=max(1, steps - (steps // 2)),
         lr=lr,
+        device=device,
+    )
+    global_hybrid = run_global_hybrid_optimizer(
+        target_func=target_func,
+        ndim=dim,
+        scout_epochs=max(1, int(steps * 0.6)),
+        refine_epochs=max(1, steps - int(steps * 0.6)),
+        lr=lr,
+        starts=starts,
+        init_range=init_range,
+        device=device,
     )
 
     return {
         adam.method: adam.loss_h,
         hybrid.method: hybrid.loss_h,
+        global_hybrid.method: global_hybrid.loss_h,
     }
 
-def run_statistical_sweep(landscape="rastrigin", dim=5, steps=200, lr=1e-2, n_trials=10, seed=42):
-    finals = {"Adam": [], "Hybrid v3.9": []}
+
+def run_all_landscape_comparison(
+    landscapes=None,
+    dim=10,
+    steps=500,
+    lr=1e-2,
+    trials=1,
+    seed=42,
+    device="auto",
+    starts=8,
+):
+    if landscapes is None:
+        landscapes = list(LANDSCAPES)
+
+    rows = []
+    histories_by_landscape = {}
+    for landscape in landscapes:
+        print(f"\n>>> Comparing all optimizers on {landscape} ({dim}D)")
+        for trial in range(trials):
+            trial_seed = seed + trial
+            np.random.seed(trial_seed)
+            torch.manual_seed(trial_seed)
+            histories = compare_optimizers(
+                landscape=landscape,
+                dim=dim,
+                steps=steps,
+                lr=lr,
+                device=device,
+                starts=starts,
+            )
+            histories_by_landscape[(landscape, trial)] = histories
+            known_min = KNOWN_MINIMA.get(landscape)
+            for method, history in histories.items():
+                final_loss = float(history[-1])
+                error = final_loss if known_min is None else abs(final_loss - known_min)
+                rows.append(
+                    {
+                        "Landscape": landscape,
+                        "Trial": trial,
+                        "Method": method,
+                        "Final Loss": final_loss,
+                        "Optimization Error": error,
+                        "Reconstruction Error": _reconstruction_error(history),
+                        "Best Loss": float(np.min(history)),
+                        "Steps": len(history),
+                    }
+                )
+
+    return pd.DataFrame(rows), histories_by_landscape
+
+def run_statistical_sweep(landscape="rastrigin", dim=5, steps=200, lr=1e-2, n_trials=10, seed=42, device="auto", starts=8):
+    finals = {"Adam": [], "Hybrid v3.9": [], "Global Hybrid": []}
 
     for trial in range(n_trials):
         np.random.seed(seed + trial)
         torch.manual_seed(seed + trial)
-        histories = compare_optimizers(landscape=landscape, dim=dim, steps=steps, lr=lr)
+        histories = compare_optimizers(landscape=landscape, dim=dim, steps=steps, lr=lr, device=device, starts=starts)
         for name, hist in histories.items():
             finals[name].append(hist[-1])
 
@@ -71,7 +169,7 @@ def run_statistical_sweep(landscape="rastrigin", dim=5, steps=200, lr=1e-2, n_tr
         for name, values in finals.items()
     }
 
-def run_dimension_sweep(landscape="rastrigin", dims=None, steps=200, lr=1e-2, n_trials=10):
+def run_dimension_sweep(landscape="rastrigin", dims=None, steps=200, lr=1e-2, n_trials=10, device="auto", starts=8):
     if dims is None:
         dims = [2, 5, 10, 20, 50]
 
@@ -83,6 +181,8 @@ def run_dimension_sweep(landscape="rastrigin", dims=None, steps=200, lr=1e-2, n_
             steps=steps,
             lr=lr,
             n_trials=n_trials,
+            device=device,
+            starts=starts,
         )
         results[dim] = {
             f"{name}_mean_final": values["mean_final"]
@@ -91,25 +191,27 @@ def run_dimension_sweep(landscape="rastrigin", dims=None, steps=200, lr=1e-2, n_
 
     return results
 
-def run_statistical_validation(dimensions=[10, 20, 50], trials=30):
+def run_statistical_validation(dimensions=[10, 20, 50], trials=30, device="auto", starts=8):
     test_funcs = [rastrigin, ackley]
     detailed_stats = []
 
     for dim in dimensions:
         for f in test_funcs:
             print(f"\n>>> Testing {f.__name__.upper()} in {dim}D...")
-            adam_finals, hybrid_finals = [], []
+            adam_finals, hybrid_finals, global_finals = [], [], []
             
             for t in range(trials):
                 np.random.seed(t)
                 torch.manual_seed(t)
                 theta_init = np.random.uniform(-5, 5, size=(dim,))
 
-                res_a = run_pytorch_optimizer('Adam', theta_init.tolist(), target_func=f, epochs=1200, lr=0.02)
+                res_a = run_pytorch_optimizer('Adam', theta_init.tolist(), target_func=f, epochs=1200, lr=0.02, device=device)
                 adam_finals.append(res_a.loss_h[-1])
 
-                res_h = run_hybrid_v3_9(f, ndim=dim, scout_epochs=400, refine_epochs=800, lr=0.02)
+                res_h = run_hybrid_v3_9(f, ndim=dim, scout_epochs=400, refine_epochs=800, lr=0.02, device=device)
                 hybrid_finals.append(res_h.loss_h[-1])
+                res_g = run_global_hybrid_optimizer(f, ndim=dim, scout_epochs=600, refine_epochs=600, lr=0.02, starts=starts, device=device)
+                global_finals.append(res_g.loss_h[-1])
 
             u_stat, p_val = mannwhitneyu(adam_finals, hybrid_finals)
             
@@ -120,13 +222,15 @@ def run_statistical_validation(dimensions=[10, 20, 50], trials=30):
                 'Adam Std': np.std(adam_finals),
                 'Hybrid Mean': np.mean(hybrid_finals),
                 'Hybrid Std': np.std(hybrid_finals),
+                'Global Hybrid Mean': np.mean(global_finals),
+                'Global Hybrid Std': np.std(global_finals),
                 'P-Value': p_val,
                 'Avg Gain (%)': ((np.mean(adam_finals) - np.mean(hybrid_finals)) / (np.mean(adam_finals) + 1e-9)) * 100
             })
             
     return pd.DataFrame(detailed_stats)
 
-def run_publication_sweep(dimensions=[10, 20, 50], trials=30):
+def run_publication_sweep(dimensions=[10, 20, 50], trials=30, device="auto"):
     test_funcs = [rastrigin, ackley, schwefel, griewank]
     detailed_stats = []
 
@@ -143,10 +247,10 @@ def run_publication_sweep(dimensions=[10, 20, 50], trials=30):
                 init_range = 500 if f.__name__ == 'schwefel' else 5
                 theta_init = np.random.uniform(-init_range, init_range, size=(dim,))
 
-                res_a = run_pytorch_optimizer('Adam', theta_init.tolist(), target_func=f, epochs=1200, lr=0.02)
+                res_a = run_pytorch_optimizer('Adam', theta_init.tolist(), target_func=f, epochs=1200, lr=0.02, device=device)
                 a_finals.append(res_a.loss_h[-1])
 
-                res_h = run_hybrid_v3_9(f, ndim=dim, scout_epochs=400, refine_epochs=800, lr=0.02)
+                res_h = run_hybrid_v3_9(f, ndim=dim, scout_epochs=400, refine_epochs=800, lr=0.02, device=device)
                 h_finals.append(res_h.loss_h[-1])
             
             u_stat, p_val = mannwhitneyu(a_finals, h_finals)

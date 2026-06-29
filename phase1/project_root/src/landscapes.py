@@ -15,7 +15,7 @@ def cost_np(x: np.ndarray):
     return cost(torch.tensor(x , dtype = torch.float)).item()
 def rastrigin(theta : torch.Tensor):
     A = 10 
-    return A + len(theta) + torch.sum(theta**2 - A* torch.cos(2*np.pi*theta))
+    return A * len(theta) + torch.sum(theta**2 - A* torch.cos(2*np.pi*theta))
 def ackley(theta : torch.Tensor):
     a , b , c = 20 , 0.2  , 2* np.pi 
     d = len(theta )
@@ -30,7 +30,8 @@ def schwefel(theta : torch.Tensor):
     return 418.9829 * d - torch.sum(theta * torch.sin(torch.sqrt(torch.abs(theta))))
 def griewank(theta : torch.Tensor):
     sum_part = torch.sum(theta**2)/4000
-    prod_part = torch.prod(torch.cos(theta / torch.sqrt (torch.arange(1 , len(theta) + 1 , dtype = torch.float64 ))))
+    idx = torch.arange(1, len(theta) + 1, dtype=theta.dtype, device=theta.device)
+    prod_part = torch.prod(torch.cos(theta / torch.sqrt(idx)))
     return sum_part - prod_part + 1 
 def levy(theta : torch.Tensor) : 
     w = 1 + (theta - 1 ) / 4 

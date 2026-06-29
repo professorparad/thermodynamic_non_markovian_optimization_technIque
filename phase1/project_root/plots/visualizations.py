@@ -99,6 +99,46 @@ def plot_dimension_sweep(sweep_data, title="Dimension Sweep", figsize=(10, 6), s
     return fig
 
 
+def plot_all_landscape_summary(results_df, title="All Landscape Comparison", figsize=(12, 6), save_path=None):
+    fig, ax = plt.subplots(figsize=figsize)
+    plot_df = results_df.copy()
+    plot_df["Optimization Error"] = plot_df["Optimization Error"].clip(lower=1e-12)
+    sns.barplot(data=plot_df, x="Landscape", y="Optimization Error", hue="Method", ax=ax)
+    ax.set_yscale("log")
+    ax.set_title(title)
+    ax.set_ylabel("Final Optimization Error (log)")
+    ax.grid(True, axis="y", alpha=0.25)
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
+def plot_error_vs_reconstruction(results_df, title="Error vs Reconstruction", figsize=(9, 6), save_path=None):
+    fig, ax = plt.subplots(figsize=figsize)
+    plot_df = results_df.dropna(subset=["Reconstruction Error"]).copy()
+    if plot_df.empty:
+        ax.text(0.5, 0.5, "MPS reconstruction unavailable", ha="center", va="center")
+    else:
+        plot_df["Optimization Error"] = plot_df["Optimization Error"].clip(lower=1e-12)
+        plot_df["Reconstruction Error"] = plot_df["Reconstruction Error"].clip(lower=1e-12)
+        sns.scatterplot(
+            data=plot_df,
+            x="Reconstruction Error",
+            y="Optimization Error",
+            hue="Method",
+            style="Landscape",
+            s=90,
+            ax=ax,
+        )
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.grid(True, which="both", alpha=0.25)
+    ax.set_title(title)
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
 def plot_trajectory(trajectory, title="Parameter Trajectory (first 2 dims)", figsize=(7, 7), save_path=None):
     fig, ax = plt.subplots(figsize=figsize)
     ax.plot(trajectory[:, 0], trajectory[:, 1], "o-", markersize=3, linewidth=1, alpha=0.8)
